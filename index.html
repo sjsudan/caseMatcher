@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Case Matcher Mobile</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- SheetJS (Excel) -->
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    
+    <!-- PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+
+    <style>
+        /* Custom Loading Animation */
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border-left-color: #3b82f6;
+            animation: spin 1s ease infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useCallback, useRef } = React;
+
+        // ---------------------------------------------------------
+        // ALGORITHM PORT (Python -> JavaScript)
+        // ---------------------------------------------------------
+
+        // --- Normalizers ---
+        const normCaseType = (s) => {
+            if (!s) return "";
+            s = String(s).toUpperCase().trim();
+            s = s.replace(/[.\s()]/g, "");
+            s = s.replace("WPC", "WPC") // Redundant in JS but keeping structure
+                 .replace("WP(C)", "WPC")
+                 .replace("OW P", "OWP")
+                 .replace("C P OWP", "CPOWP");
+            // Custom fixes based on your script
+            if (s.includes("WPC")) return "WPC"; 
+            return s;
+        };
+
+        const normYear = (token) => {
+            if (!token) return "";
+            token = String(token).toUpperCase().trim();
+            const m = token.match(/^(\d+)\s*\/\s*(\d{2,4})$/);
+            if (!m) return token;
+            
+            let [_, num, year] = m;
+            let numNorm = num;
+            try {
+                numNorm = String(parseInt(num)).padStart(2, '0');
+            } catch(e) {}
+
+            let yearNorm = year;
+            if (year.length === 4 && year !== "2000") {
+                yearNorm = year.slice(-2);
+            }
+            return `${numNorm}/${yearNorm}`;
+        };
+
+        const cleanTitleForMatch = (t) => {
+            if (!t) return "";
+            t = String(t).toUpperCase();
+            // Remove lawyer markers
+            t = t.replace(/\b(FOR\s+(PET|RES|APPLICANT|RESPONDENT)|CAVEAT|AAG\b|DAG\b|DSGI\b|GA\b|SR\.?\s*ADV|ADV\.)[\w\s\.]*/g, " ");
+            t = t.replace(/\bAND\s+OTHERS?\b/g, " ");
+            t = t.replace(/\bAND\s+ANR\.?\b/g, " ");
+            t = t.replace(/[^\w\s]/g, " ");
+            t = t.replace(/\s+/g, " ");
+            return t.trim();
+        };
+
+        const formatFullTitle = (parts) => {
+            const full = parts.join(" ");
+            return full.replace(/\s+/g, " ").trim();
+        };
+
+        const truncateTitleForDisplay = (title) => {
+            if (!title) return "";
+            const pat = /\b(FOR\s+(PET|RES|APPLICANT|RESPONDENT)|CAVEAT|AAG\b|DAG\b|DSGI\b|GA\b|SR\.?\s*ADV|ADV\.)\b/i;
+            const match = title.match(pat);
+            if (match && match.index !== undefined) {
+                return title.substring(0, match.index).trim();
+            }
+            return title;
+        };
+
+        // --- Parsing Logic ---
+        const parseBlocks = (lines) => {
+            // JS Regex translation of: r"^\s*(\d+)\s+([A-Za-z()\.]+)\s+([A-Za-z0-9\-()/ ]+/\d{2,4})\s*(.*)$"
+            const startPat = /^\s*(\d+)\s+([A-Za-z()\.]+)\s+([A-Za-z0-9\-()/ ]+\/\d{2,4})\s*(.*)$/i;
+            const cwInlinePat = /(?:\bc\/w\b|\bwith\b)\s*(?:(?<ctype>[A-Za-z()\.]+)\s+)?(?<cno>[A-Za-z0-9\-() ]+\/\d{2,4})(?:\s+(?<title>[^\n]+))?/gi;
+
+            const rows = [];
+            let i = 0;
+
+            while (i < lines.length) {
+                const match = lines[i].match(startPat);
+                if (!match) {
+                    i++;
+                    continue;
+                }
+
+                const [_, sno, ctypeRaw, cnoRaw, rest] = match;
+                const ctype = normCaseType(ctypeRaw);
+                const cno = normYear(cnoRaw);
+                let headerTail = (rest || "").trim();
+
+                const titleParts = [];
+                if (headerTail) titleParts.push(headerTail);
+
+                let capturingTitle = true;
+                let j = i + 1;
+                const blockLines = [lines[i]];
+
+                while (j < lines.length) {
+                    // Check if next line starts a new case
+                    if (startPat.test(lines[j])) break;
+
+                    const ln = lines[j];
+                    blockLines.push(ln);
+                    
+                    const isClubbed = /^\s*(c\/w|with)\b/i.test(ln);
+                    if (isClubbed) capturingTitle = false;
+
+                    if (capturingTitle) titleParts.push(ln.trim());
+                    j++;
+                }
+                i = j;
+
+                const fullTitle = formatFullTitle(titleParts);
+                rows.push({
+                    "S.No": sno,
+                    "Case Type": ctype,
+                    "Case No.": cno,
+                    "Title": fullTitle,
+                    "_TitleSrc": "Parsed"
+                });
+
+                // Check for inline clubbed cases
+                const blockText = blockLines.join("\n");
+                // Reset regex lastIndex for global search
+                cwInlinePat.lastIndex = 0;
+                let m;
+                while ((m = cwInlinePat.exec(blockText)) !== null) {
+                    const groups = m.groups || {};
+                    const ct2 = normCaseType(groups.ctype || ctype);
+                    const cn2 = normYear(groups.cno);
+                    const t2 = (groups.title || "").trim();
+                    rows.push({
+                        "S.No": sno,
+                        "Case Type": ct2,
+                        "Case No.": cn2,
+                        "Title": t2,
+                        "_TitleSrc": "Clubbed inline"
+                    });
+                }
+            }
+            return rows;
+        };
+
+        // --- Matcher Engine ---
+        const matchEngine = (row, byCtCno, byCno) => {
+            const ct = row["Case Type"];
+            const cno = row["Case No."];
+            const title = row["Title"] || "";
+
+            // 1. Exact Match
+            const key = `${ct}|${cno}`;
+            const recs = byCtCno[key];
+
+            if (recs && recs.length > 0) {
+                const fileNos = [...new Set(recs.map(r => String(r["File No."])))].sort();
+                const fnoStr = fileNos.join(" | ");
+                const first = recs[0];
+                const verb = `${fnoStr} ${first["Case Type"]} ${first["Case No."]} ${first["Title"] || ""}`;
+                
+                let matchType = "Exact (type+no)";
+                if (fileNos.length > 1) matchType += ` [Found ${fileNos.length}]`;
+                
+                return { fno: fnoStr, verb, chk: matchType };
+            }
+
+            // 2. Cross-type (Fuzzy)
+            const cands = byCno[cno] || [];
+            if (cands.length > 0 && title) {
+                const tqClean = cleanTitleForMatch(title);
+                const tqList = tqClean.split(/\s+/);
+                const firstToken = tqList[0];
+
+                let best = null;
+                let bestScore = -1;
+
+                for (const cand of cands) {
+                    const candTitle = String(cand.title_clean || "");
+                    const candTokens = candTitle.split(/\s+/);
+                    
+                    // First token check
+                    if (candTokens.length > 0 && firstToken && candTokens[0] === firstToken) {
+                        const fno = cand["File No."];
+                        const verb = `${fno} ${cand["Case Type"]} ${cand["Case No."]} ${cand["Title"] || ""}`;
+                        return { fno, verb, chk: "Cross-type first-token match" };
+                    }
+
+                    // Overlap score
+                    const candSet = new Set(candTokens);
+                    const overlap = tqList.reduce((acc, val) => acc + (candSet.has(val) ? 1 : 0), 0);
+                    
+                    if (overlap > bestScore) {
+                        bestScore = overlap;
+                        best = cand;
+                    }
+                }
+
+                if (best && bestScore >= 1) {
+                    const fno = best["File No."];
+                    const verb = `${fno} ${best["Case Type"]} ${best["Case No."]} ${best["Title"] || ""}`;
+                    return { fno, verb, chk: "Cross-type title overlap" };
+                }
+                return { fno: "", verb: "", chk: "No overlap (type mismatch)" };
+            }
+
+            return { fno: "", verb: "", chk: "Not found" };
+        };
+
+
+        // ---------------------------------------------------------
+        // COMPONENT: App
+        // ---------------------------------------------------------
+        function App() {
+            const [step, setStep] = useState(1);
+            const [masterData, setMasterData] = useState(null);
+            const [processedData, setProcessedData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [logs, setLogs] = useState([]);
+            const [stats, setStats] = useState(null);
+
+            const addLog = (msg) => setLogs(prev => [...prev, msg]);
+
+            // --- Step 1: Load Master ---
+            const handleMasterUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                setLoading(true);
+                addLog(`Reading Master File: ${file.name}...`);
+
+                try {
+                    const data = await file.arrayBuffer();
+                    const workbook = XLSX.read(data);
+                    
+                    // Load all sheets (Brute Force Loader)
+                    let allRows = [];
+                    workbook.SheetNames.forEach(sheetName => {
+                        const sheet = workbook.Sheets[sheetName];
+                        const json = XLSX.utils.sheet_to_json(sheet);
+                        // Add sheet name if needed, but mostly we need the data
+                        json.forEach(r => r["__sheet__"] = sheetName);
+                        allRows = [...allRows, ...json];
+                    });
+
+                    // Indexing
+                    addLog(`Indexing ${allRows.length} rows...`);
+                    
+                    // Pre-process master for speed
+                    const byCtCno = {};
+                    const byCno = {};
+
+                    allRows.forEach(r => {
+                        // Normalize keys
+                        const ctNorm = normCaseType(r["Case Type"]);
+                        const cnoNorm = normYear(r["Case No."]);
+                        r.title_clean = cleanTitleForMatch(r["Title"]);
+                        r["Case Type"] = ctNorm; // store normalized for better matching display? Or keep original? 
+                        // Python script normalizes matches but displays originals mostly. 
+                        // We'll store normalized in the row object for logic.
+                        r._ctNorm = ctNorm;
+                        r._cnoNorm = cnoNorm;
+
+                        const key = `${ctNorm}|${cnoNorm}`;
+                        
+                        if (!byCtCno[key]) byCtCno[key] = [];
+                        byCtCno[key].push(r);
+
+                        if (cnoNorm) {
+                            if (!byCno[cnoNorm]) byCno[cnoNorm] = [];
+                            byCno[cnoNorm].push(r);
+                        }
+                    });
+
+                    setMasterData({ byCtCno, byCno, count: allRows.length });
+                    setLoading(false);
+                    setStep(2);
+                    addLog("Master file indexed successfully.");
+
+                } catch (err) {
+                    console.error(err);
+                    addLog(`Error loading master: ${err.message}`);
+                    setLoading(false);
+                }
+            };
+
+            // --- Step 2: Process PDF ---
+            const handlePdfUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                setLoading(true);
+                addLog(`Parsing PDF: ${file.name}...`);
+
+                try {
+                    const buffer = await file.arrayBuffer();
+                    const pdf = await pdfjsLib.getDocument(buffer).promise;
+                    
+                    let fullTextLines = [];
+
+                    // PDF Parsing: Extract items and sort to simulate lines
+                    // This is crucial to match pdfplumber's "physical" extraction
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const textContent = await page.getTextContent();
+                        
+                        // Group by Y coordinate (roughly) to form lines
+                        const lineMap = {};
+                        textContent.items.forEach(item => {
+                            // item.transform[5] is Y position. 
+                            // We round it to avoid float jitter splitting lines.
+                            const y = Math.round(item.transform[5]); 
+                            if (!lineMap[y]) lineMap[y] = [];
+                            lineMap[y].push(item);
+                        });
+
+                        // Sort lines by Y descending (PDF coords start bottom-left usually, but we want top-down)
+                        const sortedYs = Object.keys(lineMap).sort((a, b) => b - a);
+                        
+                        sortedYs.forEach(y => {
+                            // Sort items in line by X ascending
+                            const lineItems = lineMap[y].sort((a, b) => a.transform[4] - b.transform[4]);
+                            // Join with space
+                            const lineStr = lineItems.map(it => it.str).join(" "); // simple join
+                            // Note: pdfplumber is smarter about spacing, but this is a decent web approximation
+                            if (lineStr.trim()) fullTextLines.push(lineStr);
+                        });
+                    }
+
+                    addLog(`Extracted ${fullTextLines.length} lines. Parsing blocks...`);
+                    
+                    const parsedRows = parseBlocks(fullTextLines);
+                    addLog(`Found ${parsedRows.length} cases in PDF.`);
+
+                    // Match
+                    addLog("Matching against master database...");
+                    
+                    const results = parsedRows.map(row => {
+                        const matchResult = matchEngine(row, masterData.byCtCno, masterData.byCno);
+                        return {
+                            "S.No": row["S.No"],
+                            "Case Type": row["Case Type"],
+                            "Case No.": row["Case No."],
+                            "Title": truncateTitleForDisplay(row["Title"]),
+                            "File No.": matchResult.fno,
+                            "Matched Details": matchResult.verb,
+                            "Check": matchResult.chk
+                        };
+                    });
+
+                    // Stats
+                    const found = results.filter(r => r["File No."]).length;
+                    setStats({
+                        total: results.length,
+                        found: found,
+                        missing: results.length - found,
+                        rate: results.length ? ((found / results.length) * 100).toFixed(1) : 0
+                    });
+
+                    setProcessedData(results);
+                    setLoading(false);
+                    setStep(3);
+
+                } catch (err) {
+                    console.error(err);
+                    addLog(`Error processing PDF: ${err.message}`);
+                    setLoading(false);
+                }
+            };
+
+            // --- Step 3: Export ---
+            const exportExcel = () => {
+                const ws = XLSX.utils.json_to_sheet(processedData);
+                
+                // Set column widths (approximate)
+                const wscols = [
+                    {wch: 6}, {wch: 10}, {wch: 15}, {wch: 40}, {wch: 15}, {wch: 50}, {wch: 20}
+                ];
+                ws['!cols'] = wscols;
+
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Causelist");
+                XLSX.writeFile(wb, "Causelist_Matched.xlsx");
+            };
+
+            const reset = () => {
+                setStep(1);
+                setMasterData(null);
+                setProcessedData(null);
+                setLogs([]);
+                setStats(null);
+            };
+
+            return (
+                <div className="max-w-md mx-auto min-h-screen bg-white shadow-xl overflow-hidden flex flex-col relative">
+                    {/* Header */}
+                    <div className="bg-blue-600 p-4 text-white shadow-md z-10">
+                        <h1 className="text-xl font-bold flex items-center">
+                            <svg className="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                            Case Matcher
+                        </h1>
+                        <p className="text-blue-100 text-sm">Algorithm v2.6 (Web Port)</p>
+                    </div>
+
+                    {/* Content */}
+                    <div className="flex-1 p-5 flex flex-col">
+                        
+                        {/* Progress Bar */}
+                        <div className="flex mb-6 justify-between relative">
+                             <div className="absolute top-1/2 left-0 w-full h-1 bg-gray-200 -z-10"></div>
+                             <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${step >= 1 ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-500'}`}>1</div>
+                             <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${step >= 2 ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-500'}`}>2</div>
+                             <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${step >= 3 ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-500'}`}>3</div>
+                        </div>
+
+                        {/* Step 1: Master File */}
+                        {step === 1 && (
+                            <div className="animate-fade-in">
+                                <h2 className="text-lg font-semibold mb-2 text-gray-700">1. Upload Master Data</h2>
+                                <p className="text-sm text-gray-500 mb-4">Select the Excel or CSV file containing your master records (Case Type, Case No, File No).</p>
+                                
+                                <label className="flex flex-col w-full h-32 border-2 border-blue-300 border-dashed rounded-lg cursor-pointer hover:bg-blue-50 transition-colors">
+                                    <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                                        <svg className="w-8 h-8 mb-3 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                                        <p className="mb-2 text-sm text-gray-500"><span className="font-semibold">Click to upload</span> Master</p>
+                                    </div>
+                                    <input type="file" className="hidden" accept=".xlsx,.xls,.csv" onChange={handleMasterUpload} disabled={loading} />
+                                </label>
+                            </div>
+                        )}
+
+                        {/* Step 2: PDF File */}
+                        {step === 2 && (
+                            <div className="animate-fade-in">
+                                <h2 className="text-lg font-semibold mb-2 text-gray-700">2. Upload Causelist PDF</h2>
+                                <p className="text-sm text-gray-500 mb-4">Select the Causelist PDF to match against {masterData?.count} master records.</p>
+                                
+                                <label className="flex flex-col w-full h-32 border-2 border-red-300 border-dashed rounded-lg cursor-pointer hover:bg-red-50 transition-colors">
+                                    <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                                        <svg className="w-8 h-8 mb-3 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                                        <p className="mb-2 text-sm text-gray-500"><span className="font-semibold">Click to upload</span> PDF</p>
+                                    </div>
+                                    <input type="file" className="hidden" accept=".pdf" onChange={handlePdfUpload} disabled={loading} />
+                                </label>
+                            </div>
+                        )}
+
+                        {/* Step 3: Results */}
+                        {step === 3 && stats && (
+                            <div className="animate-fade-in flex flex-col h-full">
+                                <h2 className="text-lg font-semibold mb-2 text-gray-700">Analysis Complete</h2>
+                                
+                                <div className="grid grid-cols-3 gap-2 mb-4">
+                                    <div className="bg-blue-50 p-3 rounded text-center">
+                                        <div className="text-2xl font-bold text-blue-600">{stats.total}</div>
+                                        <div className="text-xs text-blue-400 uppercase">Total</div>
+                                    </div>
+                                    <div className="bg-green-50 p-3 rounded text-center">
+                                        <div className="text-2xl font-bold text-green-600">{stats.found}</div>
+                                        <div className="text-xs text-green-400 uppercase">Found</div>
+                                    </div>
+                                    <div className="bg-red-50 p-3 rounded text-center">
+                                        <div className="text-2xl font-bold text-red-600">{stats.missing}</div>
+                                        <div className="text-xs text-red-400 uppercase">Missing</div>
+                                    </div>
+                                </div>
+
+                                <button onClick={exportExcel} className="w-full bg-green-600 text-white py-3 rounded-lg font-semibold shadow-lg hover:bg-green-700 transition-all flex items-center justify-center mb-3">
+                                    <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                    Download Excel Report
+                                </button>
+
+                                <button onClick={reset} className="text-sm text-gray-500 hover:text-gray-800 underline text-center">
+                                    Process Another File
+                                </button>
+
+                                {/* Preview List */}
+                                <div className="mt-4 flex-1 overflow-auto border rounded bg-gray-50 text-xs">
+                                    <table className="w-full text-left">
+                                        <thead className="bg-gray-200 sticky top-0">
+                                            <tr>
+                                                <th className="p-2">S.No</th>
+                                                <th className="p-2">Case</th>
+                                                <th className="p-2">File No</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {processedData.slice(0, 50).map((row, i) => (
+                                                <tr key={i} className={row["File No."] ? "bg-green-50 border-b" : "bg-red-50 border-b"}>
+                                                    <td className="p-2 border-r">{row["S.No"]}</td>
+                                                    <td className="p-2 border-r truncate max-w-[100px]">
+                                                        {row["Case Type"]} {row["Case No."]}
+                                                        <div className="text-[10px] text-gray-500 truncate">{row["Title"]}</div>
+                                                    </td>
+                                                    <td className="p-2 font-bold">{row["File No."] || "-"}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                    {processedData.length > 50 && <div className="p-2 text-center text-gray-400 italic">Showing first 50 of {processedData.length} rows</div>}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Loading Overlay */}
+                        {loading && (
+                            <div className="absolute inset-0 bg-white/90 z-50 flex flex-col items-center justify-center p-6 text-center">
+                                <div className="spinner mb-4"></div>
+                                <p className="text-lg font-semibold text-gray-700">Processing...</p>
+                                <div className="text-xs text-gray-400 mt-2 max-h-32 overflow-hidden w-full text-left font-mono bg-gray-100 p-2 rounded">
+                                    {logs.slice(-5).map((l, i) => <div key={i}>{l}</div>)}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById("root"));
+        root.render(<App />);
+    </script>
+</body>
+</html>
