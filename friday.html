@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Revenue Case Matcher v2.2 (Multi-Sheet Search)</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- SheetJS (Excel) -->
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    
+    <!-- PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+
+    <style>
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border-left-color: #8b5cf6;
+            animation: spin 1s ease infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        // ---------------------------------------------------------
+        // PDF TEXT EXTRACTION
+        // ---------------------------------------------------------
+        async function extractTextFromPdf(pdfDocument, updateLog) {
+            const fullLines = [];
+            const Y_TOLERANCE = 6; 
+            
+            for (let i = 1; i <= pdfDocument.numPages; i++) {
+                if (i % 5 === 0) updateLog(`Scanning page ${i} of ${pdfDocument.numPages}...`);
+                const page = await pdfDocument.getPage(i);
+                const textContent = await page.getTextContent();
+                const items = textContent.items;
+
+                if (items.length === 0) continue;
+
+                const visibleItems = items.filter(item => item.str.trim().length > 0);
+                visibleItems.sort((a, b) => {
+                    const yDiff = b.transform[5] - a.transform[5];
+                    if (Math.abs(yDiff) > Y_TOLERANCE) return yDiff;
+                    return a.transform[4] - b.transform[4];
+                });
+
+                let currentLine = [];
+                let lastY = visibleItems.length > 0 ? visibleItems[0].transform[5] : 0;
+
+                for (const item of visibleItems) {
+                    const y = item.transform[5];
+                    if (Math.abs(y - lastY) <= Y_TOLERANCE) {
+                        currentLine.push(item);
+                    } else {
+                        if (currentLine.length > 0) processLineItems(currentLine, fullLines);
+                        currentLine = [item];
+                        lastY = y;
+                    }
+                }
+                if (currentLine.length > 0) processLineItems(currentLine, fullLines);
+            }
+            return fullLines.join("\n");
+        }
+
+        function processLineItems(lineItems, outputArray) {
+            lineItems.sort((a, b) => a.transform[4] - b.transform[4]);
+            let lineStr = "";
+            let lastX = 0;
+            let lastWidth = 0;
+
+            lineItems.forEach((item, idx) => {
+                if (idx > 0) {
+                    const gap = item.transform[4] - (lastX + lastWidth);
+                    if (gap > 4 || item.str.startsWith(" ")) lineStr += " "; 
+                }
+                lineStr += item.str.trim();
+                lastX = item.transform[4];
+                lastWidth = item.width;
+            });
+            if (lineStr.trim()) outputArray.push(lineStr);
+        }
+
+        // ---------------------------------------------------------
+        // REVENUE MATCHER LOGIC (Multi-Sheet Search)
+        // ---------------------------------------------------------
+
+        const normalizeCaseType = (s) => {
+            if (typeof s !== 'string') return "";
+            return s.replace(/[^a-z0-9]/gi, '').toLowerCase();
+        };
+
+        const normalizeYear = (yStr) => {
+            if (!yStr) return "";
+            yStr = String(yStr).trim();
+            if (yStr === "2000") return "2000";
+            if (yStr.length === 4) return yStr.slice(2);
+            return yStr;
+        }
+
+        const parseCauselistInGroups = (rawText) => {
+            const groups = [];
+            const courtSplits = rawText.split(/(Court No\s*-\s*\d+)/i);
+            let currentCourt = "Unknown";
+            
+            const blocks = [];
+            blocks.push({ name: "Pre-court", content: courtSplits[0] });
+            
+            for (let i = 1; i < courtSplits.length; i += 2) {
+                blocks.push({ name: courtSplits[i], content: courtSplits[i+1] || "" });
+            }
+
+            for (const block of blocks) {
+                if (block.name !== "Pre-court") currentCourt = block.name.trim();
+                const chunks = block.content.split(/^\s*(\d{1,3})\)\s*/m);
+                
+                for (let i = 1; i < chunks.length; i += 2) {
+                    const currentGroup = [];
+                    const sNo = chunks[i];
+                    const contentBlock = chunks[i+1];
+                    const withSplit = contentBlock.split(/\nWITH\s+/i);
+
+                    const processBlock = (txt, sn) => {
+                        const lines = txt.split('\n').map(l => l.trim()).filter(l => l);
+                        if (lines.length > 0) {
+                            const caseNumLine = lines[0];
+                            const titleLines = lines.slice(1).filter(l => {
+                                const lower = l.toLowerCase();
+                                return ![" for pet.", " for res.", " aag", " asgi", " sr adv", " dy ag"].some(x => lower.includes(x));
+                            });
+                            currentGroup.push({
+                                court: currentCourt,
+                                's.no': sn,
+                                case_number_line: caseNumLine,
+                                title: titleLines.join(' ')
+                            });
+                        }
+                    };
+
+                    processBlock(withSplit[0], sNo);
+                    if (withSplit.length > 1) {
+                        for (let k = 1; k < withSplit.length; k++) {
+                            processBlock(withSplit[k], `WITH ${sNo}`);
+                        }
+                    }
+                    if (currentGroup.length > 0) groups.push(currentGroup);
+                }
+            }
+            return groups;
+        };
+
+        const getCasePossibilities = (caseLine) => {
+            let primaryInfo = null;
+            let secondaryInfo = null;
+
+            const parsePattern = (s) => {
+                const match = s.match(/([A-Za-z\s\(\)\.]+?)\s*\/\s*(\d+)\s*\/\s*(\d{2,4})/);
+                return match ? [match[1], match[2], match[3]] : null;
+            };
+
+            if (caseLine.toUpperCase().includes("IA NO") || caseLine.toUpperCase().includes("ΙΑ ΝΟ")) {
+                const inClause = caseLine.match(/in\s*\[([^\]]+)\]/i);
+                if (inClause) primaryInfo = parsePattern(inClause[1]);
+            } else {
+                primaryInfo = parsePattern(caseLine);
+                const inClause = caseLine.match(/in\s*\[([^\]]+)\]/i);
+                if (inClause) secondaryInfo = parsePattern(inClause[1]);
+            }
+            return { primaryInfo, secondaryInfo };
+        };
+
+        const performMatch = (caseInfoTuple, masterSheets, caseTitle) => {
+            if (!caseInfoTuple) {
+                return { status: "Parse Error", result: { 'file no.': 'Not Found', 'matched source': 'Not Found', 'check column': 'Case Number Parse Error' }};
+            }
+
+            const [cType, cNum, cYearFull] = caseInfoTuple;
+            const normCType = normalizeCaseType(cType);
+            const targetYearNorm = normalizeYear(cYearFull);
+            
+            // Determine year int for Sheet Selection
+            let yearInt = parseInt(cYearFull, 10);
+            if (cYearFull.length === 2) {
+                yearInt = yearInt > 50 ? 1900 + yearInt : 2000 + yearInt;
+            }
+
+            // 1. Identify ALL relevant sheets (Multi-Sheet Logic)
+            // This handles "2023", "2023..", "23" all at once.
+            let relevantSheets = [];
+            const allSheetNames = Object.keys(masterSheets);
+            const fullYearStr = String(yearInt);
+
+            if (yearInt >= 1991 && yearInt <= 2012) {
+                // Specific logic: 1991-2012 look in 2002 sheets
+                relevantSheets = allSheetNames.filter(s => s.startsWith('2002'));
+            } else {
+                // General logic: Look for sheets starting with "2023" OR strictly "23"
+                relevantSheets = allSheetNames.filter(s => {
+                    if (s.startsWith(fullYearStr)) return true; // "2023", "2023..", "2023 final"
+                    if (s === fullYearStr.slice(2)) return true; // "23"
+                    return false;
+                });
+            }
+
+            if (relevantSheets.length === 0) {
+                 return { status: "Not Found", result: { 'file no.': 'Not Found', 'matched source': `No sheets found for year ${yearInt}`, 'check column': 'Missing Sheet' }};
+            }
+
+            // 2. Search across ALL relevant sheets
+            let allMatches = [];
+
+            for (const sheetName of relevantSheets) {
+                const masterRows = masterSheets[sheetName];
+                
+                const sheetMatches = masterRows.filter(row => {
+                    const mTypeRaw = row['case type'] || "";
+                    const mTypeNorm = normalizeCaseType(mTypeRaw);
+                    
+                    const mNoRaw = row['case no.'] ? String(row['case no.']) : "";
+                    const [mNum, mYearRaw] = mNoRaw.includes('/') ? mNoRaw.split('/') : [mNoRaw.trim(), ""];
+                    
+                    const mNumClean = mNum.trim();
+                    const mYearNorm = normalizeYear(mYearRaw);
+
+                    // Compare Number & Year
+                    const numMatch = (Number(mNumClean) == Number(cNum));
+                    // If master row has no year, match mainly on number & sheet placement
+                    const yearMatch = mYearNorm === "" ? true : (mYearNorm === targetYearNorm);
+
+                    let typeMatch = false;
+                    if (['wpc', 'owp'].includes(normCType)) {
+                        typeMatch = ['wpc', 'owp'].includes(mTypeNorm);
+                    } else {
+                        typeMatch = (mTypeNorm === normCType);
+                    }
+
+                    return numMatch && yearMatch && typeMatch;
+                });
+
+                // Enrich matches with Source Sheet Name
+                sheetMatches.forEach(m => {
+                    m._sourceSheet = sheetName;
+                    allMatches.push(m);
+                });
+            }
+
+            // 3. Analyze Combined Results
+            if (allMatches.length === 1) {
+                const matchRow = allMatches[0];
+                const fileNo = matchRow['file no.'];
+                const rowVals = Object.values(matchRow).filter(k => k !== matchRow._sourceSheet).join(',');
+                const matchedSource = `Sheet: ${matchRow._sourceSheet}, Row: ${rowVals.substring(0, 40)}...`;
+                
+                const clTitleClean = caseTitle.replace(/[^a-z0-9]/gi, '').toLowerCase();
+                const mTitleClean = (matchRow['title'] || "").replace(/[^a-z0-9]/gi, '').toLowerCase();
+                
+                let checkCol = '';
+                if (clTitleClean.length > 5 && mTitleClean.length > 5) {
+                     if (!mTitleClean.includes(clTitleClean.substring(0, 10)) && !clTitleClean.includes(mTitleClean.substring(0, 10))) {
+                        checkCol = 'Check Party Name';
+                     }
+                }
+
+                return { status: "Success", result: { 'file no.': fileNo, 'matched source': matchedSource, 'check column': checkCol }};
+
+            } else if (allMatches.length > 1) {
+                // Dedup based on File No
+                const uniqueFileNos = [...new Set(allMatches.map(m => m['file no.']))];
+                const sheetsFound = [...new Set(allMatches.map(m => m._sourceSheet))].join(", ");
+                
+                if (uniqueFileNos.length === 1) {
+                    // Multiple rows but same file no (likely duplicates across sheets) - Treat as Success
+                    return { status: "Success", result: { 'file no.': uniqueFileNos[0], 'matched source': `Found in Sheets: ${sheetsFound}`, 'check column': 'Duplicate Rows in Master' }};
+                }
+
+                return { status: "Multiple", result: { 'file no.': 'Multiple Matches', 'matched source': `Sheets: ${sheetsFound}, Files: ${uniqueFileNos.join(", ")}`, 'check column': 'Review Multiple' }};
+            } else {
+                return { status: "Not Found", result: { 'file no.': 'Not Found', 'matched source': `Checked Sheets: ${relevantSheets.join(", ")}`, 'check column': 'Check Case Type/No' }};
+            }
+        };
+
+        // ---------------------------------------------------------
+        // UI COMPONENT
+        // ---------------------------------------------------------
+        function App() {
+            const [step, setStep] = useState(1);
+            const [masterSheets, setMasterSheets] = useState(null);
+            const [processedData, setProcessedData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [logs, setLogs] = useState([]);
+            const [stats, setStats] = useState(null);
+            const [exportMode, setExportMode] = useState('cleaned');
+
+            const addLog = (msg) => setLogs(prev => [...prev.slice(-6), msg]);
+
+            const handleMasterUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                setLoading(true);
+                addLog(`Reading Master File...`);
+
+                try {
+                    const data = await file.arrayBuffer();
+                    const workbook = XLSX.read(data);
+                    const sheets = {};
+                    let totalRows = 0;
+
+                    workbook.SheetNames.forEach(sheetName => {
+                        const cleanName = sheetName.trim();
+                        const sheet = workbook.Sheets[sheetName];
+                        const json = XLSX.utils.sheet_to_json(sheet);
+                        
+                        if (json.length > 0) {
+                            const sanitizedRows = json.map(row => {
+                                const newRow = {};
+                                Object.keys(row).forEach(k => {
+                                    const cleanKey = k.toLowerCase().trim().replace(/\./g, "");
+                                    if (cleanKey.includes("fileno") || cleanKey === "file no") newRow["file no."] = row[k];
+                                    else if (cleanKey.includes("caseno") || cleanKey === "case no") newRow["case no."] = row[k];
+                                    else if (cleanKey.includes("casetype") || cleanKey === "case type") newRow["case type"] = row[k];
+                                    else if (cleanKey === "title" || cleanKey.includes("party")) newRow["title"] = row[k];
+                                    else newRow[cleanKey] = row[k];
+                                });
+                                return newRow;
+                            });
+                            
+                            const first = sanitizedRows[0];
+                            if (first && first["file no."] !== undefined && first["case no."] !== undefined) {
+                                sheets[cleanName] = sanitizedRows;
+                                totalRows += sanitizedRows.length;
+                            }
+                        }
+                    });
+
+                    if (totalRows === 0) throw new Error("No valid columns found. Headers must contain 'File No', 'Case No', 'Case Type'.");
+
+                    setMasterSheets(sheets);
+                    setLoading(false);
+                    setStep(2);
+                    addLog(`Loaded ${Object.keys(sheets).length} sheets (${totalRows} rows).`);
+
+                } catch (err) {
+                    console.error(err);
+                    addLog(`Error: ${err.message}`);
+                    setLoading(false);
+                }
+            };
+
+            const handlePdfUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                setLoading(true);
+                setLogs([]); 
+                addLog(`Processing PDF...`);
+
+                try {
+                    const buffer = await file.arrayBuffer();
+                    const pdf = await pdfjsLib.getDocument(buffer).promise;
+                    const rawText = await extractTextFromPdf(pdf, addLog);
+                    
+                    addLog("Parsing case groups...");
+                    const groups = parseCauselistInGroups(rawText);
+                    
+                    addLog("Matching against master data...");
+                    const results = [];
+                    
+                    groups.forEach(group => {
+                        const processedGroup = [];
+                        let hasSuccess = false;
+
+                        group.forEach(kase => {
+                            const { primaryInfo, secondaryInfo } = getCasePossibilities(kase.case_number_line);
+                            
+                            let match = performMatch(primaryInfo, masterSheets, kase.title);
+                            
+                            if (match.status === "Not Found" && secondaryInfo) {
+                                const secMatch = performMatch(secondaryInfo, masterSheets, kase.title);
+                                if (secMatch.status === "Success" || secMatch.status === "Multiple") {
+                                    secMatch.result['check column'] = `Matched Fallback: ${secondaryInfo.join('/')}`;
+                                    match = secMatch;
+                                }
+                            }
+
+                            if (match.status === "Success" || match.status === "Multiple") hasSuccess = true;
+                            processedGroup.push({ ...kase, ...match.result });
+                        });
+
+                        if (hasSuccess) results.push(...processedGroup);
+                    });
+
+                    const found = results.filter(r => r['file no.'] !== 'Not Found').length;
+                    setStats({
+                        total: results.length,
+                        found: found,
+                        missing: results.length - found,
+                        rate: results.length ? ((found / results.length) * 100).toFixed(1) : 0
+                    });
+
+                    setProcessedData(results);
+                    setLoading(false);
+                    setStep(3);
+
+                } catch (err) {
+                    console.error(err);
+                    addLog(`Error: ${err.message}`);
+                    setLoading(false);
+                }
+            };
+
+            const exportExcel = () => {
+                let dataToExport = processedData;
+                if (exportMode === 'cleaned') {
+                    dataToExport = processedData.filter(r => r["file no."] && r["file no."] !== "Not Found");
+                }
+                
+                const finalRows = dataToExport.map(r => ({
+                    "S.No": r["s.no"],
+                    "Casetype and Case Number": r["case_number_line"],
+                    "Title": r["title"],
+                    "File No.": r["file no."],
+                    "Matched Source": r["matched source"],
+                    "Check Column": r["check column"]
+                }));
+
+                const ws = XLSX.utils.json_to_sheet(finalRows);
+                const wscols = [{wch: 10}, {wch: 35}, {wch: 40}, {wch: 15}, {wch: 35}, {wch: 20}];
+                ws['!cols'] = wscols;
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "RevenueCauselist");
+                XLSX.writeFile(wb, "Revenue_Matched_List.xlsx");
+            };
+
+            return (
+                <div className="max-w-xl mx-auto min-h-screen bg-white shadow-2xl overflow-hidden flex flex-col border-x border-slate-200">
+                    <div className="bg-violet-800 p-5 text-white shadow-md z-10">
+                        <h1 className="text-xl font-bold tracking-wide flex items-center gap-2">
+                            <span className="bg-white/20 p-1.5 rounded-md">⚖️</span>
+                            Revenue Case Matcher
+                        </h1>
+                        <p className="text-violet-200 text-xs mt-1">v2.2: Multi-Sheet Search</p>
+                    </div>
+
+                    <div className="flex-1 p-6 flex flex-col">
+                        <div className="flex mb-8 justify-between relative px-8">
+                             <div className="absolute top-1/2 left-8 right-8 h-0.5 bg-slate-200 -z-10 transform -translate-y-1/2"></div>
+                             {[1, 2, 3].map(s => (
+                                 <div key={s} className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm transition-all duration-300 
+                                    ${step >= s ? 'bg-violet-600 text-white scale-110 ring-4 ring-white shadow' : 'bg-slate-200 text-slate-400'}`}>
+                                    {s}
+                                 </div>
+                             ))}
+                        </div>
+
+                        {step === 1 && (
+                            <div className="animate-fade-in">
+                                <div className="bg-violet-50 border border-violet-100 rounded-lg p-4 mb-4 text-sm text-violet-800">
+                                    <strong>Step 1:</strong> Upload Master Excel.<br/>
+                                    <span className="text-xs opacity-75">Scans all variations (e.g., "2023", "2023..").</span>
+                                </div>
+                                <label className="flex flex-col w-full h-40 border-2 border-slate-300 border-dashed rounded-xl cursor-pointer hover:bg-violet-50 hover:border-violet-400 transition-all group">
+                                    <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                                        <div className="p-3 bg-slate-100 rounded-full mb-3 group-hover:bg-white transition-colors shadow-sm">
+                                            <svg className="w-6 h-6 text-slate-400 group-hover:text-violet-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
+                                        </div>
+                                        <p className="text-sm text-slate-500 font-medium">Upload Master File</p>
+                                    </div>
+                                    <input type="file" className="hidden" accept=".xlsx,.xls,.csv" onChange={handleMasterUpload} disabled={loading} />
+                                </label>
+                            </div>
+                        )}
+
+                        {step === 2 && (
+                            <div className="animate-fade-in">
+                                <div className="bg-blue-50 border border-blue-100 rounded-lg p-4 mb-4 text-sm text-blue-800">
+                                    <strong>Step 2:</strong> Upload Causelist PDF.<br/>
+                                    <span className="text-xs opacity-75">Extracting Cases & Brackets...</span>
+                                </div>
+                                <label className="flex flex-col w-full h-40 border-2 border-slate-300 border-dashed rounded-xl cursor-pointer hover:bg-blue-50 hover:border-blue-400 transition-all group">
+                                    <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                                        <div className="p-3 bg-slate-100 rounded-full mb-3 group-hover:bg-white transition-colors shadow-sm">
+                                            <svg className="w-6 h-6 text-slate-400 group-hover:text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
+                                        </div>
+                                        <p className="text-sm text-slate-500 font-medium">Upload PDF</p>
+                                    </div>
+                                    <input type="file" className="hidden" accept=".pdf" onChange={handlePdfUpload} disabled={loading} />
+                                </label>
+                            </div>
+                        )}
+
+                        {step === 3 && stats && (
+                            <div className="animate-fade-in flex flex-col h-full">
+                                <div className="grid grid-cols-3 gap-3 mb-6">
+                                    <div className="bg-slate-100 p-3 rounded-lg text-center border border-slate-200">
+                                        <div className="text-lg font-bold text-slate-700">{stats.total}</div>
+                                        <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Cases</div>
+                                    </div>
+                                    <div className="bg-green-50 p-3 rounded-lg text-center border border-green-100">
+                                        <div className="text-lg font-bold text-green-600">{stats.found}</div>
+                                        <div className="text-[10px] font-bold text-green-400 uppercase tracking-wider">Found</div>
+                                    </div>
+                                    <div className="bg-red-50 p-3 rounded-lg text-center border border-red-100">
+                                        <div className="text-lg font-bold text-red-600">{stats.missing}</div>
+                                        <div className="text-[10px] font-bold text-red-400 uppercase tracking-wider">Missing</div>
+                                    </div>
+                                </div>
+
+                                <div className="bg-slate-50 p-1 rounded-lg flex text-sm mb-3 border border-slate-200">
+                                    <button 
+                                        onClick={() => setExportMode('cleaned')} 
+                                        className={`flex-1 py-2 rounded-md font-medium transition-all ${exportMode === 'cleaned' ? 'bg-white text-violet-600 shadow-sm ring-1 ring-slate-200' : 'text-slate-500 hover:text-slate-700'}`}
+                                    >
+                                        Matches Only
+                                    </button>
+                                    <button 
+                                        onClick={() => setExportMode('full')} 
+                                        className={`flex-1 py-2 rounded-md font-medium transition-all ${exportMode === 'full' ? 'bg-white text-blue-600 shadow-sm ring-1 ring-slate-200' : 'text-slate-500 hover:text-slate-700'}`}
+                                    >
+                                        Full List
+                                    </button>
+                                </div>
+
+                                <button onClick={exportExcel} className={`w-full py-3 rounded-xl font-semibold shadow-lg transition-all flex items-center justify-center mb-4 ${exportMode === 'cleaned' ? 'bg-violet-600 hover:bg-violet-700 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}>
+                                    <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                    Download Excel
+                                </button>
+
+                                <button onClick={() => { setStep(1); setMasterSheets(null); setProcessedData(null); }} className="text-xs text-slate-400 hover:text-violet-600 font-medium text-center">
+                                    Start Over
+                                </button>
+
+                                <div className="mt-4 flex-1 overflow-hidden border rounded-lg bg-white flex flex-col">
+                                    <div className="bg-slate-50 p-2 text-xs font-bold text-slate-500 uppercase tracking-wide border-b">Preview</div>
+                                    <div className="overflow-auto flex-1">
+                                        <table className="w-full text-left text-sm">
+                                            <tbody>
+                                                {processedData.slice(0, 50).map((row, i) => (
+                                                    <tr key={i} className={`border-b last:border-0 ${row["file no."] !== "Not Found" ? "bg-green-50/50" : "bg-white"}`}>
+                                                        <td className="p-2 text-xs text-slate-400 w-10">{row["s.no"]}</td>
+                                                        <td className="p-2">
+                                                            <div className="font-medium text-slate-700 text-xs">{row["case_number_line"]}</div>
+                                                            <div className="text-[10px] text-slate-400 truncate max-w-[150px]">{row["title"]}</div>
+                                                            {row["matched source"] !== "Not Found" && row["matched source"].includes("No sheets") && (
+                                                                <div className="text-[9px] text-red-400 font-mono mt-1">{row["matched source"]}</div>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-2 text-right">
+                                                            {row["file no."] !== "Not Found" ? (
+                                                                <span className="inline-block bg-green-100 text-green-700 px-1.5 py-0.5 rounded text-[10px] font-bold">{row["file no."]}</span>
+                                                            ) : (
+                                                                <span className="text-slate-300 text-[10px]">-</span>
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {loading && (
+                            <div className="absolute inset-0 bg-white/95 z-50 flex flex-col items-center justify-center p-8 text-center backdrop-blur-sm">
+                                <div className="spinner mb-6"></div>
+                                <p className="text-lg font-bold text-slate-700 animate-pulse">Processing...</p>
+                                <div className="w-full max-w-xs mt-4 bg-slate-100 rounded-lg p-3 font-mono text-[10px] text-slate-500 text-left h-32 overflow-hidden border border-slate-200 shadow-inner">
+                                    {logs.map((l, i) => <div key={i} className="truncate mb-1">→ {l}</div>)}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById("root"));
+        root.render(<App />);
+    </script>
+</body>
+</html>
