@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -20,7 +21,7 @@
 </head>
 <body class="bg-slate-100 h-screen w-full flex items-center justify-center p-2 md:p-6 overflow-hidden text-slate-800">
 
-    <!-- App Container: Centered, responsive height, fixed max-width -->
+    <!-- App Container -->
     <div class="w-full max-w-xl bg-white shadow-xl rounded-2xl border border-slate-200 flex flex-col h-full max-h-[90vh] overflow-hidden relative">
         
         <!-- Header -->
@@ -62,7 +63,7 @@
 
         <!-- Search -->
         <div class="p-2 bg-slate-50 border-b shrink-0 z-10">
-            <input type="text" id="searchInput" oninput="debounceRender()" placeholder="Search File No or Case No..." class="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 transition shadow-sm">
+            <input type="text" id="searchInput" oninput="debounceRender()" placeholder="Search Case, Justice, or File/Year (e.g. 1/07)..." class="w-full px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 transition shadow-sm">
         </div>
 
         <!-- List View -->
@@ -77,7 +78,7 @@
             </button>
         </div>
 
-        <!-- Custom Confirmation Modal (Inside container to ensure visibility) -->
+        <!-- Custom Confirmation Modal -->
         <div id="confirmModal" class="absolute inset-0 bg-black/60 hidden items-center justify-center z-50 backdrop-blur-sm transition-opacity opacity-0 pointer-events-none" style="transition: opacity 0.2s;">
             <div class="bg-white p-6 rounded-xl shadow-2xl max-w-[85%] w-full transform scale-95 transition-transform border border-slate-100" id="confirmModalContent">
                 <h3 class="text-lg font-bold mb-2 text-slate-800">Confirm Action</h3>
@@ -106,17 +107,35 @@
 
         // --- 2. Initial Render & CLEANUP ---
         document.addEventListener('DOMContentLoaded', () => {
-             // MIGRATION 1: Fix numeric IDs to Strings
              let dataFixed = false;
+             
+             // MIGRATION & CLEANUP
              db = db.map(item => {
+                // Fix numeric IDs
                 if (typeof item.id === 'number') {
                     item.id = "id_" + String(item.id).replace('.', '_'); 
                     dataFixed = true;
                 }
+                // Fix Justice Names (Shorten existing data)
+                if (item.justice) {
+                    const shortName = shortenJusticeName(item.justice);
+                    if (shortName !== item.justice) {
+                        item.justice = shortName;
+                        dataFixed = true;
+                    }
+                }
+                // Fix File Numbers (Remove spaces from existing data)
+                if (item.fileNo) {
+                    const cleanFileNo = String(item.fileNo).replace(/\s+/g, '');
+                    if (cleanFileNo !== item.fileNo) {
+                        item.fileNo = cleanFileNo;
+                        dataFixed = true;
+                    }
+                }
                 return item;
              });
              
-             // MIGRATION 2: REMOVE files with no File Number (As requested)
+             // REMOVE files with no File Number
              const originalLength = db.length;
              db = db.filter(item => item.fileNo && item.fileNo.toString().trim() !== '');
              if (db.length !== originalLength) {
@@ -135,6 +154,29 @@
         });
 
         // --- 3. Core Functions ---
+        
+        // Helper: Justice Name Shortener
+        function shortenJusticeName(name) {
+            if (!name) return "";
+            const n = name.toUpperCase().replace(/\s+/g, ' ').trim();
+            
+            // 1. Specific Short Mappings (Priority)
+            if (n.includes("CHIEF JUSTICE") && n.includes("RAJNESH OSWAL")) return "DB-I";
+            if (n.includes("SINDHU SHARMA") && n.includes("SHAHZAD AZEEM")) return "DB-II";
+            if (n.includes("JAVED IQBAL WANI")) return "Iqbal Wani";
+            if (n.includes("MOHD. YOUSUF WANI") || n.includes("MOHD YOUSUF WANI")) return "Yousuf Wani";
+            if (n.includes("RAHUL BHARTI")) return "Rahul Bharti";
+            if (n.includes("MOKSHA KHAJURIA KAZMI")) return "Kazmi";
+            
+            // 2. Generic Cleanup for others
+            // Removes: Hon'ble, Honble, Mr., Mrs., Ms., Justice, The, Chief (Case insensitive)
+            let clean = name.replace(/\b(Hon'?ble|Mr\.?|Mrs\.?|Ms\.?|Justice|The|Chief)\b/gi, "");
+            
+            // Clean up extra spaces/punctuation
+            clean = clean.replace(/\s+/g, ' ').trim();
+            
+            return clean;
+        }
 
         function generateId() {
             return 'id_' + Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
@@ -217,13 +259,12 @@
 
             let importedCount = 0;
             let skippedNoFileNo = 0;
-            let skippedInvalidCase = 0;
             const importDate = new Date().toLocaleDateString();
             
             const existingSignatures = new Set(db.map(i => i.caseNo + '|' + i.importDate));
             const newItems = [];
             
-            // Auto-Detect Column logic
+            // Auto-Detect Column logic for Case No
             const casePattern = /[A-Z]+\s*\d{1,6}\/\d{2,4}/i; 
             let bestCol = 1; 
             let maxScore = 0;
@@ -245,22 +286,58 @@
                 if (score > maxScore) { maxScore = score; bestCol = parseInt(col); }
             }
 
+            let currentJustice = ""; // Store current justice name context
+            let lastValidSNo = ""; // Store last valid S.No for connected cases
+
             rows.forEach(row => {
                 if (!Array.isArray(row)) return;
+
+                // 1. Detect Justice Header (Context)
+                const rowStr = row.map(c => String(c).toUpperCase()).join(' ');
+                if (rowStr.includes("JUSTICE") || rowStr.includes("HON'BLE")) {
+                    // Find the cell with the justice name
+                    const justiceCell = row.find(c => c && (String(c).toUpperCase().includes("JUSTICE") || String(c).toUpperCase().includes("HON'BLE")));
+                    if (justiceCell) {
+                        // Clean and Shorten immediately
+                        let rawJustice = String(justiceCell).replace(/["']/g, "").trim();
+                        currentJustice = shortenJusticeName(rawJustice);
+                    }
+                    // Continue, don't return, as this row usually isn't a case row
+                }
                 
+                // 2. Extract Case
                 let rawCase = row[bestCol];
                 if (isValidCase(rawCase)) {
                     const caseNo = rawCase.trim();
                     const uniqueKey = caseNo + '|' + importDate;
                     
                     if (!existingSignatures.has(uniqueKey)) {
-                        let details = row[bestCol + 1] || row[bestCol - 1] || "";
+                        
+                        // EXTRACT S.NO STRICTLY (Column before Case No)
+                        let sNo = "";
+                        if (bestCol > 0) {
+                             const rawSNo = row[bestCol - 1];
+                             if (rawSNo !== undefined && rawSNo !== null) {
+                                 sNo = String(rawSNo).trim();
+                             }
+                        }
+
+                        // HANDLE CONNECTED CASES (c/w, cw, with)
+                        const sNoLower = sNo.toLowerCase();
+                        if (sNoLower.includes('c/w') || sNoLower.includes('cw') || sNoLower.includes('with')) {
+                             sNo = lastValidSNo; // Use S.No from previous valid row
+                        } else if (sNo) {
+                             lastValidSNo = sNo; // Update last valid S.No
+                        }
+
+                        // DETAILS Extraction (Strictly AFTER Case No now, ensuring we don't grab S.No)
+                        let details = row[bestCol + 1] || "";
                         if (typeof details !== 'string') details = String(details);
 
-                        // Improved File No Extraction (Handles 0 correctly)
+                        // Improved File No Extraction (Handles 0 correctly, removes spaces)
                         let fileNo = row[bestCol + 2];
                         if (fileNo === undefined || fileNo === null) fileNo = "";
-                        fileNo = String(fileNo).trim();
+                        fileNo = String(fileNo).trim().replace(/\s+/g, ''); // REMOVE SPACES
                         
                         // STRICT FILTER: Ignore imports without File No
                         if (!fileNo || fileNo === "") {
@@ -270,9 +347,11 @@
 
                         newItems.push({
                             id: generateId(),
+                            sNo: sNo, // Store strict S.No
                             caseNo: caseNo,
                             fileNo: fileNo, 
                             details: details.replace('(Revenue)', '').replace(/\s+/g, ' ').trim().substring(0, 50),
+                            justice: currentJustice, // Add Justice Context (Shortened)
                             importDate: importDate,
                             status: 'sent',
                             timestamp: Date.now()
@@ -281,9 +360,6 @@
                         existingSignatures.add(uniqueKey);
                         importedCount++;
                     }
-                } else {
-                    // Just tracking for debugging, usually headers or invalid rows
-                    if(row.some(cell => cell)) skippedInvalidCase++; 
                 }
             });
 
@@ -321,22 +397,49 @@
             const listContainer = document.getElementById('fileList');
             const countTotal = document.getElementById('countTotal');
             const countPending = document.getElementById('countPending');
-            const filterText = document.getElementById('searchInput').value.toLowerCase();
+            const filterText = document.getElementById('searchInput').value.toLowerCase().trim();
             
             const displayList = db
-                .filter(item => 
-                    !filterText || 
-                    item.caseNo.toLowerCase().includes(filterText) ||
-                    (item.fileNo && item.fileNo.toLowerCase().includes(filterText))
-                )
+                .filter(item => {
+                    if (!filterText) return true;
+
+                    // Standard Search
+                    if (
+                        item.caseNo.toLowerCase().includes(filterText) ||
+                        (item.fileNo && item.fileNo.toLowerCase().includes(filterText)) ||
+                        (item.details && item.details.toLowerCase().includes(filterText)) || 
+                        (item.justice && item.justice.toLowerCase().includes(filterText)) ||
+                        (item.sNo && item.sNo.toLowerCase() === filterText)
+                    ) {
+                        return true;
+                    }
+
+                    // Hybrid Search: FileNo + "/" + CaseYear (Suffix)
+                    // e.g. "1/07" matches FileNo "1" and Case "OWP 16/07"
+                    if (item.fileNo && item.caseNo) {
+                        const parts = item.caseNo.split('/');
+                        if(parts.length > 1) {
+                            const yearSuffix = parts[parts.length - 1].trim(); // "07" from "16/07"
+                            const hybrid = `${item.fileNo}/${yearSuffix}`;
+                            if (hybrid.toLowerCase().includes(filterText)) return true;
+                        }
+                    }
+
+                    return false;
+                })
                 .sort((a, b) => {
                     // 1. Sort by Status (Pending/Sent first)
                     if (a.status !== b.status) return a.status === 'sent' ? -1 : 1;
                     
                     // 2. Sort by File No (Numeric)
-                    const numA = parseFloat(a.fileNo) || 0;
-                    const numB = parseFloat(b.fileNo) || 0;
-                    return numA - numB;
+                    // Handle alphanumeric: try to parse float, fallback to string compare if NaN
+                    const numA = parseFloat(a.fileNo);
+                    const numB = parseFloat(b.fileNo);
+                    
+                    if (!isNaN(numA) && !isNaN(numB)) {
+                        return numA - numB;
+                    }
+                    return a.fileNo.localeCompare(b.fileNo, undefined, { numeric: true, sensitivity: 'base' });
                 });
 
             const pendingCount = db.filter(i => i.status === 'sent').length;
@@ -350,28 +453,59 @@
             } else {
                 const visibleItems = displayList.slice(0, 200); 
                 
-                listContainer.innerHTML = visibleItems.map(item => {
+                listContainer.innerHTML = visibleItems.map((item, index) => {
                     const isReturned = item.status === 'returned';
-                    const fileBadge = `<span class="ml-2 bg-indigo-100 text-indigo-700 text-[10px] px-1.5 py-0.5 rounded font-mono border border-indigo-200">#${item.fileNo}</span>`;
                     
                     const buttonStyle = isReturned 
                         ? 'bg-slate-100 text-slate-400 border border-slate-200 hover:bg-slate-200' 
                         : 'bg-white text-orange-600 border border-orange-200 hover:bg-orange-50 hover:border-orange-300';
 
+                    const justiceHTML = item.justice 
+                        ? `<div class="text-[9px] text-indigo-500 font-semibold uppercase tracking-tight mt-0.5 flex items-center gap-1">
+                             <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
+                             ${item.justice}
+                           </div>` 
+                        : '';
+                    
+                    // USE STORED S.NO, fallback to index if missing (for legacy data)
+                    const displaySNo = item.sNo || (index + 1);
+
                     return `
                     <div class="group p-3 border-b bg-white hover:bg-slate-50 transition flex justify-between items-center gap-3 slide-in">
+                        <!-- S.No (Strict from Sheet) -->
+                        <div class="w-8 text-center text-sm font-bold text-slate-500 shrink-0 select-none flex items-center justify-center bg-slate-100 rounded-lg h-8 self-center" title="S.No">
+                            ${displaySNo}
+                        </div>
+
                         <div class="flex-1 overflow-hidden">
-                            <div class="flex items-center flex-wrap gap-1 mb-0.5">
-                                <span class="font-bold text-sm text-slate-800 ${isReturned ? 'line-through text-slate-400' : ''}">
+                            <!-- Single Line Display: Case No + FileBadge + Title -->
+                            <div class="flex items-center gap-1.5 text-xs text-slate-800 font-medium truncate leading-tight">
+                                <!-- Case No -->
+                                <span class="${isReturned ? 'line-through text-slate-400' : 'font-bold'} shrink-0">
                                     ${item.caseNo}
                                 </span>
-                                ${fileBadge}
-                                ${!isReturned ? '<span class="w-2 h-2 rounded-full bg-orange-500 animate-pulse ml-auto"></span>' : ''}
+                                
+                                <!-- File Badge (Cleaned) -->
+                                <span class="bg-indigo-100 text-indigo-700 px-1 rounded text-[10px] font-mono border border-indigo-200 shrink-0">
+                                    #${item.fileNo}
+                                </span>
+
+                                <!-- Separator -->
+                                <span class="text-slate-300 mx-0.5">|</span>
+
+                                <!-- Details (Title) -->
+                                <span class="truncate text-slate-600 ${isReturned ? 'line-through opacity-50' : ''}">
+                                    ${item.details}
+                                </span>
+                                
+                                ${!isReturned ? '<span class="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse ml-auto shrink-0"></span>' : ''}
                             </div>
-                            <div class="text-[10px] text-slate-500 truncate mt-0.5">
-                                ${item.importDate} • ${item.details}
-                            </div>
+
+                            <!-- Justice Name (Row 2) -->
+                            ${justiceHTML}
                         </div>
+
+                        <!-- Action Button -->
                         <button onclick="toggleStatus('${item.id}')" 
                             class="shrink-0 px-3 py-1.5 rounded-md text-[10px] uppercase font-bold tracking-wide transition shadow-sm ${buttonStyle}">
                             ${isReturned ? 'Undo' : 'Return'}
@@ -404,10 +538,31 @@
                 return; 
             }
             
-            let csvContent = "data:text/csv;charset=utf-8,Case No,File No,Date,Details\n";
-            pendingItems.forEach(row => {
+            // HEADERS: Date of Missing, Justice Name, S No., Case Type, Case Number, Title, File No.
+            let csvContent = "data:text/csv;charset=utf-8,Date of Missing,Justice Name,S No.,Case Type,Case Number,Title,File No.\n";
+            
+            pendingItems.forEach((row) => {
                 const safeDetails = row.details.replace(/,/g, ' ');
-                csvContent += `${row.caseNo},${row.fileNo || ''},${row.importDate},${safeDetails}\n`;
+                const safeJustice = (row.justice || '').replace(/,/g, ' ');
+                const dateMissing = row.importDate;
+                const sNo = row.sNo || '';
+                const fileNo = row.fileNo || '';
+
+                // Split Case No (e.g. "OWP 16/07" -> Type: "OWP", Num: "16/07")
+                let caseType = "";
+                let caseNum = row.caseNo;
+                
+                // Regex to split alpha prefix from remainder
+                const match = row.caseNo.match(/^([a-zA-Z\.]+)\s*(.*)/);
+                if (match) {
+                    caseType = match[1].trim();
+                    caseNum = match[2].trim();
+                }
+
+                // Force Excel Text Format for Case Number using ="value"
+                const textFormattedCaseNum = `"=""${caseNum}"""`;
+
+                csvContent += `${dateMissing},${safeJustice},${sNo},${caseType},${textFormattedCaseNum},${safeDetails},${fileNo}\n`;
             });
             
             const encodedUri = encodeURI(csvContent);
