@@ -525,6 +525,12 @@
             if (index !== -1) {
                 db[index].status = db[index].status === 'sent' ? 'returned' : 'sent';
                 saveData();
+                
+                // UX Improvement: Clear search and refocus for rapid entry
+                const searchInput = document.getElementById('searchInput');
+                searchInput.value = '';
+                searchInput.focus();
+                
                 renderList();
             } else {
                 console.error("ID Not Found:", id);
